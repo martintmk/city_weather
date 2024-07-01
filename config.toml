@@ -1,0 +1,6 @@
+output = "Table"
+level = "Info"
+
+[client]
+api_key = "<key>"
+lang = "eng"
