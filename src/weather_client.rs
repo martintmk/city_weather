@@ -1,8 +1,8 @@
+use anyhow::{bail, Context, Error, Ok};
 use getset::Getters;
 use itertools::Itertools;
 use reqwest::{Client as HttpClient, ClientBuilder, IntoUrl, StatusCode};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
-use thiserror::Error;
 use tracing::warn;
 
 use crate::utils::Timing;
@@ -34,9 +34,14 @@ pub struct CityWeather {
     temperature: f32,
 }
 
-pub struct Client {
+pub struct Offline;
+
+pub struct Connected;
+
+pub struct Client<T = Offline> {
     config: Config,
     client: HttpClient,
+    _state: std::marker::PhantomData<T>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -55,15 +60,6 @@ struct MainWeather {
     temp: f32,
 }
 
-#[derive(Debug, Error)]
-pub enum Error {
-    #[error("unauthorized: {0}")]
-    Unauthorized(String),
-
-    #[error("request failed: {0}")]
-    RequestFailed(String),
-}
-
 #[derive(Debug, Deserialize)]
 struct CityLocation {
     lat: f64,
@@ -73,14 +69,32 @@ struct CityLocation {
     name: String,
 }
 
-impl Client {
+impl Client<Offline> {
     pub fn new(config: Config) -> Self {
-        Client {
+        Client::<Offline> {
             config,
             client: ClientBuilder::new().build().unwrap(),
+            _state: std::marker::PhantomData,
         }
     }
 
+    pub async fn connect(self) -> Result<Client<Connected>, Error> {
+        let client = Client::<Connected> {
+            config: self.config,
+            client: self.client,
+            _state: std::marker::PhantomData,
+        };
+
+        client
+            .get_city_locations("London")
+            .await
+            .context("Failed to connect to the weather service.")?;
+
+        Ok(client)
+    }
+}
+
+impl Client<Connected> {
     pub async fn get_weather(&self, city: &str) -> Result<Vec<CityWeather>, Error> {
         let locations = self.get_city_locations(city).await?;
         let mut weathers = Vec::new();
@@ -131,8 +145,7 @@ impl Client {
 
         response
             .weather
-            .iter()
-            .next()
+            .first()
             .map(|v| (v.description.to_string(), response.main.temp))
     }
 
@@ -160,20 +173,15 @@ impl Client {
             .query(query)
             .query(&[("appid", &self.config.api_key)]);
 
-        let result = match request.send().await {
-            Ok(response) => {
-                if response.status() == StatusCode::UNAUTHORIZED {
-                    return Err(Error::Unauthorized("invalid API key".to_string()));
-                }
+        let result = request.send().await?;
 
-                Ok(response)
-            }
-            Err(e) => Err(Error::RequestFailed(e.to_string())),
-        }?;
+        if result.status() == StatusCode::UNAUTHORIZED {
+            bail!("Invalid API key for weather service. Please check the configuration.")
+        };
 
-        match result.json::<T>().await {
-            Ok(text) => Ok(text),
-            Err(e) => Err(Error::RequestFailed(e.to_string())),
-        }
+        Ok(result
+            .json::<T>()
+            .await
+            .context("Failed to parse JSON response.")?)
     }
 }
